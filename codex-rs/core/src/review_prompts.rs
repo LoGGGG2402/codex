@@ -1,8 +1,8 @@
 use codex_git_utils::merge_base_with_head;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_template::Template;
+use std::path::Path;
 use std::sync::LazyLock;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12,10 +12,10 @@ pub struct ResolvedReviewRequest {
     pub user_facing_hint: String,
 }
 
-const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.";
+const UNCOMMITTED_PROMPT: &str = "Review the current changes (staged, unstaged, and untracked files) and provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk.";
 
-const BASE_BRANCH_PROMPT_BACKUP: &str = "Review the code changes against the base branch '{{branch}}'. Start by finding the merge diff between the current branch and {{branch}}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{{branch}}@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {{branch}} branch. Provide prioritized, actionable findings.";
-const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect the changes relative to {{base_branch}}. Provide prioritized, actionable findings.";
+const BASE_BRANCH_PROMPT_BACKUP: &str = "Review the current changes against the base branch '{{branch}}'. Start by finding the merge diff between the current branch and {{branch}}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{{branch}}@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {{branch}} branch. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk.";
+const BASE_BRANCH_PROMPT: &str = "Review the current changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect the changes relative to {{base_branch}}. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk.";
 static BASE_BRANCH_PROMPT_BACKUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(BASE_BRANCH_PROMPT_BACKUP)
         .unwrap_or_else(|err| panic!("base branch backup review prompt must parse: {err}"))
@@ -25,8 +25,8 @@ static BASE_BRANCH_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
         .unwrap_or_else(|err| panic!("base branch review prompt must parse: {err}"))
 });
 
-const COMMIT_PROMPT_WITH_TITLE: &str = "Review the code changes introduced by commit {{sha}} (\"{{title}}\"). Provide prioritized, actionable findings.";
-const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}}. Provide prioritized, actionable findings.";
+const COMMIT_PROMPT_WITH_TITLE: &str = "Review the changes introduced by commit {{sha}} (\"{{title}}\"). Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk.";
+const COMMIT_PROMPT: &str = "Review the changes introduced by commit {{sha}}. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk.";
 static COMMIT_PROMPT_WITH_TITLE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(COMMIT_PROMPT_WITH_TITLE)
         .unwrap_or_else(|err| panic!("commit review prompt with title must parse: {err}"))
@@ -38,7 +38,7 @@ static COMMIT_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 
 pub fn resolve_review_request(
     request: ReviewRequest,
-    cwd: &AbsolutePathBuf,
+    cwd: &Path,
 ) -> anyhow::Result<ResolvedReviewRequest> {
     let target = request.target;
     let prompt = review_prompt(&target, cwd)?;
@@ -53,7 +53,7 @@ pub fn resolve_review_request(
     })
 }
 
-pub fn review_prompt(target: &ReviewTarget, cwd: &AbsolutePathBuf) -> anyhow::Result<String> {
+pub fn review_prompt(target: &ReviewTarget, cwd: &Path) -> anyhow::Result<String> {
     match target {
         ReviewTarget::UncommittedChanges => Ok(UNCOMMITTED_PROMPT.to_string()),
         ReviewTarget::BaseBranch { branch } => {
@@ -138,7 +138,7 @@ mod tests {
     fn review_prompt_template_renders_base_branch_backup_variant() {
         assert_eq!(
             render_review_prompt(&BASE_BRANCH_PROMPT_BACKUP_TEMPLATE, [("branch", "main")]),
-            "Review the code changes against the base branch 'main'. Start by finding the merge diff between the current branch and main's upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"main@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the main branch. Provide prioritized, actionable findings."
+            "Review the current changes against the base branch 'main'. Start by finding the merge diff between the current branch and main's upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"main@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the main branch. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk."
         );
     }
 
@@ -149,7 +149,7 @@ mod tests {
                 &BASE_BRANCH_PROMPT_TEMPLATE,
                 [("base_branch", "main"), ("merge_base_sha", "abc123")]
             ),
-            "Review the code changes against the base branch 'main'. The merge base commit for this comparison is abc123. Run `git diff abc123` to inspect the changes relative to main. Provide prioritized, actionable findings."
+            "Review the current changes against the base branch 'main'. The merge base commit for this comparison is abc123. Run `git diff abc123` to inspect the changes relative to main. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk."
         );
     }
 
@@ -161,10 +161,10 @@ mod tests {
                     sha: "deadbeef".to_string(),
                     title: None,
                 },
-                &AbsolutePathBuf::current_dir().expect("cwd"),
+                Path::new("."),
             )
             .expect("commit prompt should render"),
-            "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings."
+            "Review the changes introduced by commit deadbeef. Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk."
         );
     }
 
@@ -176,10 +176,10 @@ mod tests {
                     sha: "deadbeef".to_string(),
                     title: Some("Fix bug".to_string()),
                 },
-                &AbsolutePathBuf::current_dir().expect("cwd"),
+                Path::new("."),
             )
             .expect("commit prompt should render"),
-            "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings."
+            "Review the changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized findings with emphasis on exploitability, boundary crossings, regressions, and reportable risk."
         );
     }
 }

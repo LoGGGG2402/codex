@@ -5,6 +5,7 @@ use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::role::apply_default_spawn_role_to_config;
 use crate::agent::role::apply_role_to_config;
 
 pub(crate) struct Handler;
@@ -75,9 +76,15 @@ impl ToolHandler for Handler {
                 args.reasoning_effort,
             )
             .await?;
-            apply_role_to_config(&mut config, role_name)
-                .await
-                .map_err(FunctionCallError::RespondToModel)?;
+            if role_name.is_some() {
+                apply_role_to_config(&mut config, role_name)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+            } else {
+                apply_default_spawn_role_to_config(&mut config)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+            }
         }
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);

@@ -50,16 +50,31 @@ fn session_flags_layer_count(config: &Config) -> usize {
         .count()
 }
 
+#[test]
+fn default_and_root_role_constants_match_expected_values() {
+    assert_eq!(DEFAULT_ROLE_NAME, "worker");
+    assert_eq!(ROOT_AGENT_ROLE_NAME, "orchestrator");
+    assert!(!built_in::configs().contains_key("orchestrator"));
+    assert!(built_in::configs().contains_key("worker"));
+    assert!(built_in::configs().contains_key("default"));
+}
+
 #[tokio::test]
-async fn apply_role_defaults_to_default_and_leaves_config_unchanged() {
+async fn apply_role_defaults_to_worker_and_sets_worker_prompt() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let before = config.clone();
+    let before_layers = session_flags_layer_count(&config);
 
     apply_role_to_config(&mut config, /*role_name*/ None)
         .await
         .expect("default role should apply");
 
-    assert_eq!(before, config);
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some(
+            "You are a worker.\nExecute one bounded task at a time.\nDefault to implementation, bug fixing, targeted refactoring, or evidence-producing support work that root already scoped.\nRespect ownership boundaries for files and modules and adapt to concurrent edits rather than reverting them.\nEscalate back to root when scope is unclear, when the task needs reprioritization, or when you discover a materially different problem than the one assigned.\nDo not take checkpoint ownership, session synthesis ownership, or delegation strategy ownership.\nReturn the concrete outcome, evidence, blockers, and the next justified action to root.\n"
+        )
+    );
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[tokio::test]
@@ -74,16 +89,168 @@ async fn apply_role_returns_error_for_unknown_role() {
 }
 
 #[tokio::test]
-#[ignore = "No role requiring it for now"]
-async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
+async fn apply_explorer_role_is_available() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let before_layers = session_flags_layer_count(&config);
 
     apply_role_to_config(&mut config, Some("explorer"))
         .await
         .expect("explorer role should apply");
+}
 
-    assert_eq!(config.model.as_deref(), Some("gpt-5.1-codex-mini"));
+#[tokio::test]
+async fn apply_worker_role_is_available_and_sets_worker_prompt() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("worker"))
+        .await
+        .expect("worker role should apply");
+
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some(
+            "You are a worker.\nExecute one bounded task at a time.\nDefault to implementation, bug fixing, targeted refactoring, or evidence-producing support work that root already scoped.\nRespect ownership boundaries for files and modules and adapt to concurrent edits rather than reverting them.\nEscalate back to root when scope is unclear, when the task needs reprioritization, or when you discover a materially different problem than the one assigned.\nDo not take checkpoint ownership, session synthesis ownership, or delegation strategy ownership.\nReturn the concrete outcome, evidence, blockers, and the next justified action to root.\n"
+        )
+    );
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[tokio::test]
+async fn apply_default_alias_matches_worker_role() {
+    let (_home, mut default_alias_config) = test_config_with_cli_overrides(Vec::new()).await;
+    let (_home, mut worker_config) = test_config_with_cli_overrides(Vec::new()).await;
+
+    apply_role_to_config(&mut default_alias_config, Some("default"))
+        .await
+        .expect("legacy default alias should apply");
+    apply_role_to_config(&mut worker_config, Some("worker"))
+        .await
+        .expect("worker role should apply");
+
+    assert_eq!(
+        default_alias_config.developer_instructions,
+        worker_config.developer_instructions
+    );
+    assert_eq!(
+        session_flags_layer_count(&default_alias_config),
+        session_flags_layer_count(&worker_config)
+    );
+}
+
+#[tokio::test]
+async fn apply_default_spawn_role_preserves_runtime_fields_and_appends_worker_doctrine() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+    let active_profile = config.active_profile.clone();
+    config.base_instructions = Some("base instructions".to_string());
+    config.user_instructions = Some("parent user instructions".to_string());
+    config.developer_instructions = Some("Parent developer instructions.".to_string());
+    config.model = Some("gpt-5.1".to_string());
+    config.model_provider.base_url = Some("https://proxy.example.test/v1".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+    config.compact_prompt = Some("compact".to_string());
+    config.agent_max_threads = Some(7);
+    config.agent_job_max_runtime_seconds = Some(123);
+    config.agent_max_depth = 3;
+
+    apply_default_spawn_role_to_config(&mut config)
+        .await
+        .expect("default spawn role should apply");
+
+    assert_eq!(config.active_profile, active_profile);
+    assert_eq!(
+        config.base_instructions.as_deref(),
+        Some("base instructions")
+    );
+    assert_eq!(
+        config.user_instructions.as_deref(),
+        Some("parent user instructions")
+    );
+    assert_eq!(config.model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(
+        config.model_provider.base_url.as_deref(),
+        Some("https://proxy.example.test/v1")
+    );
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        config.model_reasoning_summary,
+        Some(ReasoningSummary::Detailed)
+    );
+    assert_eq!(config.compact_prompt.as_deref(), Some("compact"));
+    assert_eq!(config.agent_max_threads, Some(7));
+    assert_eq!(config.agent_job_max_runtime_seconds, Some(123));
+    assert_eq!(config.agent_max_depth, 3);
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+    let developer_instructions = config
+        .developer_instructions
+        .as_deref()
+        .expect("developer instructions should be present");
+    assert!(developer_instructions.contains("Parent developer instructions."));
+    assert!(developer_instructions.contains("You are a worker."));
+}
+
+#[tokio::test]
+async fn apply_recon_role_sets_reasoning_effort_and_adds_session_flags_layer() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("recon"))
+        .await
+        .expect("recon role should apply");
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[tokio::test]
+async fn apply_auditor_role_sets_high_reasoning_effort_and_adds_session_flags_layer() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("auditor"))
+        .await
+        .expect("auditor role should apply");
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[tokio::test]
+async fn apply_validator_role_sets_medium_reasoning_effort_and_adds_session_flags_layer() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("validator"))
+        .await
+        .expect("validator role should apply");
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[tokio::test]
+async fn apply_toolsmith_role_sets_medium_reasoning_effort_and_adds_session_flags_layer() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("toolsmith"))
+        .await
+        .expect("toolsmith role should apply");
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[tokio::test]
+async fn apply_verifier_role_sets_medium_reasoning_effort_and_adds_session_flags_layer() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let before_layers = session_flags_layer_count(&config);
+
+    apply_role_to_config(&mut config, Some("verifier"))
+        .await
+        .expect("verifier role should apply");
+
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
@@ -659,10 +826,7 @@ enabled = false
     let effective_skill_roots = plugin_outcome.effective_skill_roots();
     let skills_input = skills_load_input_from_config(&config, effective_skill_roots);
     let outcome = skills_manager
-        .skills_for_config(
-            &skills_input,
-            Some(Arc::clone(&codex_exec_server::LOCAL_FS)),
-        )
+        .skills_for_config(&skills_input, Some(codex_exec_server::LOCAL_FS.clone()))
         .await;
     let skill = outcome
         .skills
@@ -691,7 +855,8 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
 
     assert!(spec.contains("researcher: no description"));
     assert!(spec.contains("explorer: {\nuser override\n}"));
-    assert!(spec.contains("default: {\nDefault agent.\n}"));
+    assert!(spec.contains("default: {\nLegacy alias for `worker`; retained for compatibility.\n}"));
+    assert!(!spec.contains("orchestrator: {"));
     assert!(!spec.contains("Explorers are fast and authoritative."));
 }
 
@@ -709,10 +874,45 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
     let user_index = spec.find("aaa: {\nfirst\n}").expect("find user role");
     let built_in_index = spec
-        .find("default: {\nDefault agent.\n}")
+        .find("default: {\nLegacy alias for `worker`; retained for compatibility.\n}")
         .expect("find built-in role");
 
     assert!(user_index < built_in_index);
+}
+
+#[test]
+fn spawn_tool_spec_lists_legacy_and_offensive_roles() {
+    let spec = spawn_tool_spec::build(&BTreeMap::new());
+
+    assert!(spec.contains("explorer: {\nUse `explorer` for specific codebase questions."));
+    assert!(spec.contains("worker: {\nUse for execution and production work."));
+    assert!(spec.contains("Optional type name for the new agent. If omitted, `worker` is used."));
+    assert!(!spec.contains("orchestrator: {\nUse `orchestrator` as the default root role."));
+    assert!(spec.contains("recon: {\nUse `recon` for coverage-first attack-surface mapping."));
+    assert!(
+        spec.contains(
+            "auditor: {\nUse `auditor` for whitebox review of code, docs, JS, and schemas."
+        )
+    );
+    assert!(spec.contains(
+        "validator: {\nUse `validator` to confirm exploitability and reduce false positives."
+    ));
+    assert!(spec.contains(
+        "verifier: {\nUse `verifier` for command-driven implementation and runtime verification."
+    ));
+    assert!(spec.contains(
+        "toolsmith: {\nUse `toolsmith` to build offensive helpers that speed up investigation."
+    ));
+    assert!(spec.contains("plugin-backed browser or proxy discovery when available"));
+    assert!(spec.contains("do not take checkpoint ownership or reprioritize the engagement"));
+    assert!(spec.contains("prefer plugin-backed browser or proxy discovery when available"));
+    assert!(spec.contains("receive bounded task context only"));
+    assert!(spec.contains("return observed surface, uncertainty, blockers, exit status, and the next justified action to root"));
+    assert!(spec.contains("return evidence, uncertainty, blockers, exit status, and a prove, chain, or drop recommendation to root"));
+    assert!(spec.contains("They report one check at a time with command, observed output, result, and end with `VERDICT: PASS`, `VERDICT: FAIL`, or `VERDICT: PARTIAL`."));
+    assert!(spec.contains("interoperate cleanly with plugin-native artifacts and refs"));
+    assert!(spec.contains("Implement part of a feature"));
+    assert!(spec.contains("Fix tests or bugs"));
 }
 
 #[test]
@@ -766,7 +966,88 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
 }
 
 #[test]
-fn built_in_config_file_contents_resolves_explorer_only() {
+fn built_in_config_file_contents_resolves_offensive_root_role_files() {
+    let explorer = built_in::config_file_contents(Path::new("explorer.toml"))
+        .expect("explorer role file should resolve");
+    let auditor = built_in::config_file_contents(Path::new("auditor.toml"))
+        .expect("auditor role file should resolve");
+    let orchestrator = built_in::config_file_contents(Path::new("orchestrator.toml"))
+        .expect("orchestrator role file should resolve");
+    let recon =
+        built_in::config_file_contents(Path::new("recon.toml")).expect("recon should resolve");
+    let toolsmith = built_in::config_file_contents(Path::new("toolsmith.toml"))
+        .expect("toolsmith should resolve");
+    let validator = built_in::config_file_contents(Path::new("validator.toml"))
+        .expect("validator should resolve");
+    let verifier = built_in::config_file_contents(Path::new("verifier.toml"))
+        .expect("verifier should resolve");
+    let worker =
+        built_in::config_file_contents(Path::new("worker.toml")).expect("worker should resolve");
+
+    assert!(explorer.is_empty());
+    assert!(auditor.contains("You are an auditor."));
+    assert!(auditor.contains("live user prompt stream"));
+    assert!(
+        auditor.contains(
+            "Do not broaden scope, own checkpoint state, or reprioritize the engagement."
+        )
+    );
+    assert!(
+        orchestrator.contains(
+            "You are the canonical root orchestrator for authorized offensive appsec work."
+        )
+    );
+    assert!(orchestrator.contains("owns canonical root-session coordination"));
+    assert!(orchestrator.contains("Own session-level synthesis"));
+    assert!(
+        orchestrator
+            .contains("Prefer the `reddex-plugin` offensive MCP stack when it is available.")
+    );
+    assert!(orchestrator.contains("browser actions through `bb-browser`"));
+    assert!(orchestrator.contains("Use `validator` for exploitability proof"));
+    assert!(
+        orchestrator.contains(
+            "Use `verifier` after non-trivial worker or toolsmith implementation changes"
+        )
+    );
+    assert!(orchestrator.contains("Do not treat a forked child as a second root"));
+    assert!(recon.contains("You are a recon specialist."));
+    assert!(recon.contains("live user prompt stream"));
+    assert!(recon.contains("`bb-browser`"));
+    assert!(recon.contains("Return results in this contract when practical:"));
+    assert!(recon.contains("- OBSERVED SURFACE"));
+    assert!(recon.contains("- NEXT ACTION"));
+    assert!(auditor.contains("Return results in this contract when practical:"));
+    assert!(auditor.contains("- HYPOTHESES"));
+    assert!(auditor.contains("- NEXT ACTION"));
+    assert!(auditor.contains("`bb-codeintel`"));
+    assert!(toolsmith.contains("You are a toolsmith."));
+    assert!(toolsmith.contains("live user prompt stream"));
+    assert!(toolsmith.contains("consume or emit plugin-native artifacts"));
+    assert!(
+        toolsmith.contains(
+            "Do not broaden scope, own checkpoint state, or reprioritize the engagement."
+        )
+    );
+    assert!(toolsmith.contains("Return results in this contract when practical:"));
+    assert!(toolsmith.contains("- HELPER"));
+    assert!(toolsmith.contains("- NEXT ACTION"));
+    assert!(validator.contains("You are a validator."));
+    assert!(validator.contains("live user prompt stream"));
+    assert!(validator.contains("Return results in this contract when practical:"));
+    assert!(validator.contains("- EVIDENCE"));
+    assert!(validator.contains("- RECOMMENDATION"));
+    assert!(verifier.contains("You are a verifier."));
+    assert!(
+        verifier.contains(
+            "verify behavior by running checks, not by reading code and declaring success"
+        )
+    );
+    assert!(worker.contains("You are a worker."));
+    assert!(worker.contains("Execute one bounded task at a time."));
+    assert!(worker.contains("Do not take checkpoint ownership, session synthesis ownership, or delegation strategy ownership."));
+    assert!(verifier.contains("Do not edit project files."));
+    assert!(verifier.contains("VERDICT: PASS"));
     assert_eq!(
         built_in::config_file_contents(Path::new("missing.toml")),
         None

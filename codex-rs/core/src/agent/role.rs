@@ -18,6 +18,7 @@ use crate::config_loader::resolve_relative_paths_in_config_toml;
 use anyhow::anyhow;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::config_toml::ConfigToml;
+use codex_protocol::models::DeveloperInstructions;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -25,7 +26,11 @@ use std::sync::LazyLock;
 use toml::Value as TomlValue;
 
 /// The role name used when a caller omits `agent_type`.
-pub const DEFAULT_ROLE_NAME: &str = "default";
+pub const DEFAULT_ROLE_NAME: &str = "worker";
+/// The role name assigned to the root thread for metadata and root-only prompt overlay logic.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const ROOT_AGENT_ROLE_NAME: &str = "orchestrator";
+const LEGACY_DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
 /// Applies a named role layer to `config` while preserving caller-owned model selection.
@@ -50,6 +55,28 @@ pub(crate) async fn apply_role_to_config(
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
+            AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+        })
+}
+
+/// Applies the implicit default spawn role while preserving spawn-time runtime overrides.
+///
+/// Spawn handlers build a child config from the live turn, so values such as model selection,
+/// provider overrides, reasoning effort, base instructions, and inherited developer context may
+/// differ from the persisted config stack. Reloading the config stack for the default role would
+/// otherwise discard those runtime values. For the implicit default role only, we reload the role
+/// layer to keep config-layer metadata consistent, then restore runtime-owned fields and append
+/// the role doctrine onto any inherited developer instructions.
+pub(crate) async fn apply_default_spawn_role_to_config(config: &mut Config) -> Result<(), String> {
+    let role_name = DEFAULT_ROLE_NAME;
+    let role = resolve_role_config(config, role_name)
+        .cloned()
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+
+    apply_default_spawn_role_to_config_inner(config, role_name, &role)
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to apply default spawn role to config: {err}");
             AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
         })
 }
@@ -80,6 +107,141 @@ async fn apply_role_to_config_inner(
         preserve_current_provider,
     )?;
     Ok(())
+}
+
+async fn apply_default_spawn_role_to_config_inner(
+    config: &mut Config,
+    role_name: &str,
+    role: &AgentRoleConfig,
+) -> anyhow::Result<()> {
+    let is_built_in = !config.agent_roles.contains_key(role_name);
+    let Some(config_file) = role.config_file.as_ref() else {
+        return Ok(());
+    };
+    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    if role_layer_toml
+        .as_table()
+        .is_some_and(toml::map::Map::is_empty)
+    {
+        return Ok(());
+    }
+
+    let runtime_fields = DefaultSpawnRoleRuntimeFields::from_config(config);
+    let role_developer_instructions = role_layer_toml
+        .get("developer_instructions")
+        .and_then(TomlValue::as_str)
+        .map(str::to_owned);
+    let role_selects_profile = role_layer_toml.get("profile").is_some();
+    let role_selects_provider = role_layer_toml.get("model_provider").is_some();
+    let role_selects_model = role_layer_toml.get("model").is_some();
+    let role_selects_reasoning_effort = role_layer_toml.get("model_reasoning_effort").is_some();
+    let role_selects_reasoning_summary = role_layer_toml.get("model_reasoning_summary").is_some();
+    let role_selects_compact_prompt = role_layer_toml.get("compact_prompt").is_some();
+    let role_selects_agent_max_threads = role_layer_toml.get("agent_max_threads").is_some();
+    let role_selects_agent_job_max_runtime_seconds = role_layer_toml
+        .get("agent_job_max_runtime_seconds")
+        .is_some();
+    let role_selects_agent_max_depth = role_layer_toml.get("agent_max_depth").is_some();
+    let role_selects_user_instructions = role_layer_toml.get("user_instructions").is_some();
+
+    let (preserve_current_profile, preserve_current_provider) =
+        preservation_policy(config, &role_layer_toml);
+    *config = reload::build_next_config(
+        config,
+        role_layer_toml,
+        preserve_current_profile,
+        preserve_current_provider,
+    )?;
+
+    config.base_instructions = runtime_fields.base_instructions;
+    if !role_selects_profile {
+        config.active_profile = runtime_fields.active_profile;
+    }
+    if !role_selects_provider {
+        config.model_provider = runtime_fields.model_provider;
+        config.model_provider_id = runtime_fields.model_provider_id;
+    }
+    if !role_selects_model {
+        config.model = runtime_fields.model;
+    }
+    if !role_selects_reasoning_effort {
+        config.model_reasoning_effort = runtime_fields.model_reasoning_effort;
+    }
+    if !role_selects_reasoning_summary {
+        config.model_reasoning_summary = runtime_fields.model_reasoning_summary;
+    }
+    if !role_selects_compact_prompt {
+        config.compact_prompt = runtime_fields.compact_prompt;
+    }
+    config.multi_agent_v2 = runtime_fields.multi_agent_v2;
+    config.features = runtime_fields.features;
+    if !role_selects_agent_max_threads {
+        config.agent_max_threads = runtime_fields.agent_max_threads;
+    }
+    if !role_selects_agent_job_max_runtime_seconds {
+        config.agent_job_max_runtime_seconds = runtime_fields.agent_job_max_runtime_seconds;
+    }
+    if !role_selects_agent_max_depth {
+        config.agent_max_depth = runtime_fields.agent_max_depth;
+    }
+    if !role_selects_user_instructions {
+        config.user_instructions = runtime_fields.user_instructions;
+    }
+    config.developer_instructions = match (
+        runtime_fields.developer_instructions,
+        role_developer_instructions,
+    ) {
+        (Some(existing), Some(role_text)) => Some(
+            DeveloperInstructions::new(existing)
+                .concat(DeveloperInstructions::new(role_text))
+                .into_text(),
+        ),
+        (None, Some(role_text)) => Some(role_text),
+        (Some(existing), None) => Some(existing),
+        (None, None) => None,
+    };
+
+    Ok(())
+}
+
+struct DefaultSpawnRoleRuntimeFields {
+    active_profile: Option<String>,
+    user_instructions: Option<String>,
+    model: Option<String>,
+    model_provider: codex_model_provider_info::ModelProviderInfo,
+    model_provider_id: String,
+    model_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    model_reasoning_summary: Option<codex_protocol::config_types::ReasoningSummary>,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    compact_prompt: Option<String>,
+    multi_agent_v2: crate::config::MultiAgentV2Config,
+    features: crate::config::ManagedFeatures,
+    agent_max_threads: Option<usize>,
+    agent_job_max_runtime_seconds: Option<u64>,
+    agent_max_depth: i32,
+}
+
+impl DefaultSpawnRoleRuntimeFields {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            active_profile: config.active_profile.clone(),
+            user_instructions: config.user_instructions.clone(),
+            model: config.model.clone(),
+            model_provider: config.model_provider.clone(),
+            model_provider_id: config.model_provider_id.clone(),
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
+            base_instructions: config.base_instructions.clone(),
+            developer_instructions: config.developer_instructions.clone(),
+            compact_prompt: config.compact_prompt.clone(),
+            multi_agent_v2: config.multi_agent_v2.clone(),
+            features: config.features.clone(),
+            agent_max_threads: config.agent_max_threads,
+            agent_job_max_runtime_seconds: config.agent_job_max_runtime_seconds,
+            agent_max_depth: config.agent_max_depth,
+        }
+    }
 }
 
 async fn load_role_layer_toml(
@@ -354,10 +516,28 @@ mod built_in {
         static CONFIG: LazyLock<BTreeMap<String, AgentRoleConfig>> = LazyLock::new(|| {
             BTreeMap::from([
                 (
-                    DEFAULT_ROLE_NAME.to_string(),
+                    LEGACY_DEFAULT_ROLE_NAME.to_string(),
                     AgentRoleConfig {
-                        description: Some("Default agent.".to_string()),
-                        config_file: None,
+                        description: Some(
+                            "Legacy alias for `worker`; retained for compatibility."
+                                .to_string(),
+                        ),
+                        config_file: Some("worker.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    }
+                ),
+                (
+                    "worker".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use for execution and production work.
+Typical tasks:
+- Implement part of a feature
+- Fix tests or bugs
+- Split large refactors into independent chunks
+Rules:
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
+- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
+                        config_file: Some("worker.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
                     }
                 ),
@@ -376,17 +556,58 @@ Rules:
                     }
                 ),
                 (
-                    "worker".to_string(),
+                    "auditor".to_string(),
                     AgentRoleConfig {
-                        description: Some(r#"Use for execution and production work.
-Typical tasks:
-- Implement part of a feature
-- Fix tests or bugs
-- Split large refactors into independent chunks
-Rules:
-- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
-- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
-                        config_file: None,
+                        description: Some(r#"Use `auditor` for whitebox review of code, docs, JS, and schemas.
+Auditors review by trust boundary, privilege boundary, state transition, and sink rather than by folder.
+They hunt authn/authz drift, tenant isolation flaws, broken invariants, hidden risky flows, and exploit chains.
+When the `reddex-plugin` stack is available, they should prefer semantic narrowing and durable source refs over broad prose summaries.
+They own one bounded slice only, receive bounded task context only, do not take checkpoint ownership or reprioritize the engagement, and return evidence, uncertainty, blockers, exit status, and the next justified action to root."#.to_string()),
+                        config_file: Some("auditor.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    }
+                ),
+                (
+                    "recon".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use `recon` for coverage-first attack-surface mapping.
+Recon agents work from outside in: assets, entry points, routes, parameters, exposed info, and hidden surface first.
+They separate observed, inferred, and unverified surface, keep blind spots explicit, prefer plugin-backed browser or proxy discovery when available, and return observed surface, uncertainty, blockers, exit status, and the next justified action to root.
+They receive bounded task context only, do not take checkpoint ownership or reprioritize the engagement, and escalate decisions back to root."#.to_string()),
+                        config_file: Some("recon.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    }
+                ),
+                (
+                    "toolsmith".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use `toolsmith` to build offensive helpers that speed up investigation.
+Toolsmith agents write parsers, replay helpers, reducers, extractors, PoCs, and triage automation.
+They treat code as an offensive multiplier, prefer helpers that interoperate cleanly with plugin-native artifacts and refs when available, keep ownership bounded, and return the helper, any evidence it produced, uncertainty, blockers, exit status, and the next justified action to root.
+They receive bounded task context only, do not take checkpoint ownership or reprioritize the engagement, and keep their output subordinate to root."#.to_string()),
+                        config_file: Some("toolsmith.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    }
+                ),
+                (
+                    "validator".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use `validator` to confirm exploitability and reduce false positives.
+Validators turn promising signals into minimal repros, impact proof, and clear evidence with explicit limits.
+They classify outcomes as `confirmed`, `suspected`, or `needs more data`, keep scope fixed, prefer plugin-backed replay and browser proof when available, and return evidence, uncertainty, blockers, exit status, and a prove, chain, or drop recommendation to root.
+They receive bounded task context only, do not take checkpoint ownership or reprioritize the engagement, and escalate final interpretation back to root."#.to_string()),
+                        config_file: Some("validator.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    }
+                ),
+                (
+                    "verifier".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use `verifier` for command-driven implementation and runtime verification.
+Verifiers distrust code reading as proof and must run checks that exercise the implementation directly.
+They report one check at a time with command, observed output, result, and end with `VERDICT: PASS`, `VERDICT: FAIL`, or `VERDICT: PARTIAL`.
+They keep scope bounded to verification only, do not edit project files, do not take checkpoint ownership, and return verdict, evidence, blockers, and any residual risks to root."#.to_string()),
+                        config_file: Some("verifier.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
                     }
                 ),
@@ -417,9 +638,23 @@ Rules:
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
         const EXPLORER: &str = include_str!("builtins/explorer.toml");
         const AWAITER: &str = include_str!("builtins/awaiter.toml");
+        const AUDITOR: &str = include_str!("builtins/auditor.toml");
+        const ORCHESTRATOR: &str = include_str!("builtins/orchestrator.toml");
+        const RECON: &str = include_str!("builtins/recon.toml");
+        const TOOLSMITH: &str = include_str!("builtins/toolsmith.toml");
+        const VALIDATOR: &str = include_str!("builtins/validator.toml");
+        const VERIFIER: &str = include_str!("builtins/verifier.toml");
+        const WORKER: &str = include_str!("builtins/worker.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),
             "awaiter.toml" => Some(AWAITER),
+            "auditor.toml" => Some(AUDITOR),
+            "orchestrator.toml" => Some(ORCHESTRATOR),
+            "recon.toml" => Some(RECON),
+            "toolsmith.toml" => Some(TOOLSMITH),
+            "validator.toml" => Some(VALIDATOR),
+            "verifier.toml" => Some(VERIFIER),
+            "worker.toml" => Some(WORKER),
             _ => None,
         }
     }

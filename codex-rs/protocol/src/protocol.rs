@@ -102,6 +102,7 @@ pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
+pub const ROOT_AGENT_ROLE_NAME: &str = "orchestrator";
 
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2656,6 +2657,9 @@ impl SessionSource {
 
     pub fn get_agent_role(&self) -> Option<String> {
         match self {
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec => {
+                Some(ROOT_AGENT_ROLE_NAME.to_string())
+            }
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
                 agent_role.clone()
             }
@@ -3909,6 +3913,45 @@ mod tests {
         ] {
             assert_eq!(source.thread_source_name(), expected);
         }
+    }
+
+    #[test]
+    fn session_source_get_agent_role_defaults_root_sources_to_orchestrator() {
+        for source in [
+            SessionSource::Cli,
+            SessionSource::VSCode,
+            SessionSource::Exec,
+        ] {
+            assert_eq!(
+                source.get_agent_role(),
+                Some(ROOT_AGENT_ROLE_NAME.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn session_source_get_agent_role_preserves_subagent_specific_roles() {
+        assert_eq!(
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::default(),
+                depth: 1,
+                agent_nickname: Some("Scout".to_string()),
+                agent_role: Some("worker".to_string()),
+                agent_path: None,
+            })
+            .get_agent_role(),
+            Some("worker".to_string())
+        );
+        assert_eq!(
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation).get_agent_role(),
+            Some("memory builder".to_string())
+        );
+        assert_eq!(SessionSource::Mcp.get_agent_role(), None);
+        assert_eq!(
+            SessionSource::Custom("atlas".to_string()).get_agent_role(),
+            None
+        );
+        assert_eq!(SessionSource::Unknown.get_agent_role(), None);
     }
 
     #[test]
