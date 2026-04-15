@@ -251,10 +251,18 @@ else
   #   clear remote cache/execution endpoints configured in .bazelrc.
   #   https://bazel.build/reference/command-line-reference#common_options-flag--remote_cache
   #   https://bazel.build/reference/command-line-reference#common_options-flag--remote_executor
+  # --experimental_remote_downloader=:
+  #   disable the BuildBuddy-backed downloader configured in .bazelrc so Bazel
+  #   does not require a gRPC cache endpoint when forks run locally.
+  # --bes_backend= and --bes_results_url=:
+  #   disable Build Event Service uploads that also require BuildBuddy auth.
   bazel_run_args=(
     "${bazel_args[@]}"
     --remote_cache=
     --remote_executor=
+    --experimental_remote_downloader=
+    --bes_backend=
+    --bes_results_url=
   )
   if (( ${#post_config_bazel_args[@]} > 0 )); then
     bazel_run_args+=("${post_config_bazel_args[@]}")

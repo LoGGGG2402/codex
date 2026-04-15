@@ -8,6 +8,7 @@ on:
 
 jobs:
   cargo-deny:
+    if: github.repository_owner == 'openai'
     runs-on: ubuntu-latest
     defaults:
       run:

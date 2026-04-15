@@ -55,6 +55,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
+    if: github.repository_owner == 'openai'
     needs: metadata
     runs-on: ${{ matrix.runner }}
     permissions:

@@ -46,6 +46,7 @@ jobs:
           echo "::endgroup::"
 
   build:
+    if: github.repository_owner == 'openai'
     needs: tag-check
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
@@ -371,6 +372,7 @@ jobs:
             codex-rs/dist/${{ matrix.target }}/*
 
   build-windows:
+    if: github.repository_owner == 'openai'
     needs: tag-check
     uses: ./.github/workflows/rust-release-windows.yml
     with:
@@ -378,6 +380,7 @@ jobs:
     secrets: inherit
 
   argument-comment-lint-release-assets:
+    if: github.repository_owner == 'openai'
     name: argument-comment-lint release assets
     needs: tag-check
     uses: ./.github/workflows/rust-release-argument-comment-lint.yml
@@ -385,11 +388,45 @@ jobs:
       publish: true
 
   zsh-release-assets:
+    if: github.repository_owner == 'openai'
     name: zsh release assets
     needs: tag-check
     uses: ./.github/workflows/rust-release-zsh.yml
 
+  fork-build:
+    if: github.repository_owner != 'openai'
+    needs: tag-check
+    name: Build - ubuntu-24.04 - x86_64-unknown-linux-gnu
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - name: Cargo build
+        shell: bash
+        run: cargo build --locked --release --bin codex --bin codex-responses-api-proxy
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          dest="dist/x86_64-unknown-linux-gnu"
+          mkdir -p "$dest"
+          cp target/release/codex "$dest/codex-x86_64-unknown-linux-gnu"
+          cp target/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-x86_64-unknown-linux-gnu"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: codex-rs/dist/x86_64-unknown-linux-gnu/*
+
   release:
+    if: github.repository_owner == 'openai'
     needs:
       - build
       - build-windows
@@ -555,12 +592,62 @@ jobs:
             exit 1
           fi
 
+  fork-release:
+    if: github.repository_owner != 'openai'
+    needs: fork-build
+    name: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Generate release notes from tag commit message
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+          git log -1 --format=%B "${commit}" > "${notes_path}"
+          echo >> "${notes_path}"
+          echo "path=${notes_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Define release name
+        id: release_name
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#rust-v}"
+          echo "name=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+
+      - name: Add config schema release asset
+        run: cp codex-rs/core/config.schema.json dist/config-schema.json
+
+      - name: Stage installer scripts
+        run: |
+          cp scripts/install/install.sh dist/install.sh
+          cp scripts/install/install.ps1 dist/install.ps1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          name: ${{ steps.release_name.outputs.name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: ${{ steps.release_notes.outputs.path }}
+          files: dist/**
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
   # Publish to npm using OIDC authentication.
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/
   # npm docs: https://docs.npmjs.com/trusted-publishers
   publish-npm:
+    if: github.repository_owner == 'openai' && needs.release.outputs.should_publish_npm == 'true'
     # Publish to npm for stable releases and alpha pre-releases with numeric suffixes.
-    if: ${{ needs.release.outputs.should_publish_npm == 'true' }}
     name: publish-npm
     needs: release
     runs-on: ubuntu-latest
@@ -665,11 +752,9 @@ jobs:
           done
 
   winget:
+    if: github.repository_owner == 'openai' && !contains(needs.release.outputs.version, '-')
     name: winget
     needs: release
-    # Only publish stable/mainline releases to WinGet; pre-releases include a
-    # '-' in the semver string (e.g., 1.2.3-alpha.1).
-    if: ${{ !contains(needs.release.outputs.version, '-') }}
     # This job only invokes a GitHub Action to open/update the winget-pkgs PR;
     # it does not execute Windows-only tooling, so Linux is sufficient.
     runs-on: ubuntu-latest
@@ -688,6 +773,7 @@ jobs:
           token: ${{ secrets.WINGET_PUBLISH_PAT }}
 
   update-branch:
+    if: github.repository_owner == 'openai'
     name: Update latest-alpha-cli branch
     permissions:
       contents: write
