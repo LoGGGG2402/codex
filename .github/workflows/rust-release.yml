@@ -1,5 +1,9 @@
 # Release workflow for codex-rs.
-# To release, follow a workflow like:
+# Releases can be triggered either by:
+# ```
+# git push origin main
+# ```
+# after bumping `codex-rs/Cargo.toml`, or by pushing an explicit tag:
 # ```
 # git tag -a rust-v0.1.0 -m "Release 0.1.0"
 # git push origin rust-v0.1.0
