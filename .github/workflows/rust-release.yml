@@ -8,46 +8,61 @@
 name: rust-release
 on:
   push:
+    branches:
+      - main
     tags:
       - "rust-v*.*.*"
+    paths:
+      - "codex-rs/Cargo.toml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
-  tag-check:
+  release-meta:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@c2b55edffaf41a251c410bb32bed22afefa800f1 # 1.92
-      - name: Validate tag matches Cargo.toml version
+      - name: Resolve release tag and version
+        id: resolve
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          echo "::group::Tag validation"
 
-          # 1. Must be a tag and match the regex
-          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
-            || { echo "❌  Not a tag push"; exit 1; }
-          [[ "${GITHUB_REF_NAME}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
-            || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
-
-          # 2. Extract versions
-          tag_ver="${GITHUB_REF_NAME#rust-v}"
           cargo_ver="$(grep -m1 '^version' codex-rs/Cargo.toml \
                         | sed -E 's/version *= *"([^"]+)".*/\1/')"
 
-          # 3. Compare
-          [[ "${tag_ver}" == "${cargo_ver}" ]] \
-            || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
+              || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
 
-          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
-          echo "::endgroup::"
+            tag_ver="${GITHUB_REF_NAME#rust-v}"
+            [[ "${tag_ver}" == "${cargo_ver}" ]] \
+              || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
+
+            release_tag="${GITHUB_REF_NAME}"
+            release_version="${tag_ver}"
+          else
+            [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" ]] \
+              || { echo "❌  Branch releases are only allowed from ${DEFAULT_BRANCH}"; exit 1; }
+
+            release_tag="rust-v${cargo_ver}"
+            release_version="${cargo_ver}"
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
 
   build:
     if: github.repository_owner == 'openai'
-    needs: tag-check
+    needs: release-meta
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 60
@@ -373,7 +388,7 @@ jobs:
 
   build-windows:
     if: github.repository_owner == 'openai'
-    needs: tag-check
+    needs: release-meta
     uses: ./.github/workflows/rust-release-windows.yml
     with:
       release-lto: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'fat' }}
@@ -382,7 +397,7 @@ jobs:
   argument-comment-lint-release-assets:
     if: github.repository_owner == 'openai'
     name: argument-comment-lint release assets
-    needs: tag-check
+    needs: release-meta
     uses: ./.github/workflows/rust-release-argument-comment-lint.yml
     with:
       publish: true
@@ -390,12 +405,12 @@ jobs:
   zsh-release-assets:
     if: github.repository_owner == 'openai'
     name: zsh release assets
-    needs: tag-check
+    needs: release-meta
     uses: ./.github/workflows/rust-release-zsh.yml
 
   fork-build:
     if: github.repository_owner != 'openai'
-    needs: tag-check
+    needs: release-meta
     name: Build - ubuntu-24.04 - x86_64-unknown-linux-gnu
     runs-on: ubuntu-24.04
     defaults:
@@ -414,7 +429,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release --bin codex &
+          cargo build --locked --release --bin codex --bin codex-responses-api-proxy &
           cargo_pid=$!
           while kill -0 "$cargo_pid" 2>/dev/null; do
             echo "cargo build --release still running at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -428,7 +443,10 @@ jobs:
           archive_root="${RUNNER_TEMP}/codex-x86_64-unknown-linux-gnu"
           mkdir -p "$dest" "$archive_root"
           cp target/release/codex "$archive_root/codex"
-          tar -C "$archive_root" -czf "$dest/codex-x86_64-unknown-linux-gnu.tar.gz" codex
+          cp target/release/codex-responses-api-proxy "$archive_root/codex-responses-api-proxy"
+          tar -C "$archive_root" -czf "$dest/codex-x86_64-unknown-linux-gnu.tar.gz" codex codex-responses-api-proxy
+          cp target/release/codex "$dest/codex-x86_64-unknown-linux-gnu"
+          cp target/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-x86_64-unknown-linux-gnu"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: x86_64-unknown-linux-gnu
@@ -437,6 +455,7 @@ jobs:
   release:
     if: github.repository_owner == 'openai'
     needs:
+      - release-meta
       - build
       - build-windows
       - argument-comment-lint-release-assets
@@ -448,7 +467,7 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.release_name.outputs.name }}
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.release-meta.outputs.release_tag }}
       should_publish_npm: ${{ steps.npm_publish_settings.outputs.should_publish }}
       npm_tag: ${{ steps.npm_publish_settings.outputs.npm_tag }}
 
@@ -503,7 +522,7 @@ jobs:
         run: |
           # Extract the version from the tag name, which is in the format
           # "rust-v0.1.0".
-          version="${GITHUB_REF_NAME#rust-v}"
+          version="${{ needs.release-meta.outputs.release_version }}"
           echo "name=${version}" >> $GITHUB_OUTPUT
 
       - name: Determine npm publish settings
@@ -560,7 +579,8 @@ jobs:
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           name: ${{ steps.release_name.outputs.name }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.release-meta.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           body_path: ${{ steps.release_notes.outputs.path }}
           files: dist/**
           # Mark as prerelease only when the version has a suffix after x.y.z
@@ -571,21 +591,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag: ${{ github.ref_name }}
+          tag: ${{ needs.release-meta.outputs.release_tag }}
           config: .github/dotslash-config.json
 
       - uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag: ${{ github.ref_name }}
+          tag: ${{ needs.release-meta.outputs.release_tag }}
           config: .github/dotslash-zsh-config.json
 
       - uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag: ${{ github.ref_name }}
+          tag: ${{ needs.release-meta.outputs.release_tag }}
           config: .github/dotslash-argument-comment-lint-config.json
 
       - name: Trigger developers.openai.com deploy
@@ -603,7 +623,9 @@ jobs:
 
   fork-release:
     if: github.repository_owner != 'openai'
-    needs: fork-build
+    needs:
+      - release-meta
+      - fork-build
     name: release
     runs-on: ubuntu-latest
     permissions:
@@ -627,21 +649,27 @@ jobs:
         id: release_name
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#rust-v}"
+          version="${{ needs.release-meta.outputs.release_version }}"
           echo "name=${version}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
 
+      - name: Add config schema release asset
+        shell: bash
+        run: |
+          cp codex-rs/core/config.schema.json dist/config-schema.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           name: ${{ steps.release_name.outputs.name }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.release-meta.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           body_path: ${{ steps.release_notes.outputs.path }}
           files: dist/**
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
 
   # Publish to npm using OIDC authentication.
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/
